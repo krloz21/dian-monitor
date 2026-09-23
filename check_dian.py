@@ -109,10 +109,18 @@ def click_visible_text(page, text, timeout=20000):
     (una copia oculta para accesibilidad/responsive y otra visible).
     page.click("text=...") a secas agarra la primera coincidencia sin
     importar si está oculta, y se queda esperando eternamente si esa es
-    invisible. Este helper filtra solo la(s) visible(s).
+    invisible. Este helper recorre TODAS las coincidencias y hace clic en
+    la primera que esté realmente visible.
     """
-    locator = page.locator(f"text={text}").locator("visible=true")
-    locator.first.click(timeout=timeout)
+    locator = page.get_by_text(text, exact=False)
+    locator.first.wait_for(state="attached", timeout=timeout)
+    count = locator.count()
+    for i in range(count):
+        candidate = locator.nth(i)
+        if candidate.is_visible():
+            candidate.click(timeout=timeout)
+            return
+    raise Exception(f"No se encontró ningún elemento VISIBLE con texto: '{text}'")
 
 
 def check_availability() -> bool:
