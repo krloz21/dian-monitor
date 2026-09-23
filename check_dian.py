@@ -101,6 +101,20 @@ NO_CITAS_TEXTO = "No se encontraron especialidades relacionadas según los filtr
 #      Si NO aparece ese modal (y en cambio se ve un calendario/horarios) => SÍ hay citas.
 
 
+def click_visible_text(page, text, timeout=20000):
+    """
+    Hace clic en el elemento con ese texto que esté VISIBLE en pantalla.
+
+    El portal de la DIAN a veces repite el mismo texto dos veces en el HTML
+    (una copia oculta para accesibilidad/responsive y otra visible).
+    page.click("text=...") a secas agarra la primera coincidencia sin
+    importar si está oculta, y se queda esperando eternamente si esa es
+    invisible. Este helper filtra solo la(s) visible(s).
+    """
+    locator = page.locator(f"text={text}").locator("visible=true")
+    locator.first.click(timeout=timeout)
+
+
 def check_availability() -> bool:
     """
     Entra al portal, sigue el flujo Agendar cita -> Persona Natural ->
@@ -133,21 +147,24 @@ def check_availability() -> bool:
             # 1. Home -> "Agendar cita"
             page.goto(DIAN_URL, timeout=30000)
             human_delay(2, 4)
-            page.click("text=Agendar cita", timeout=20000)
+            page.screenshot(path="dian_paso1_home.png")
+            click_visible_text(page, "Agendar cita")
             human_delay()
 
             # 2. Persona Natural + Videoatención -> Siguiente
-            page.click("text=Persona Natural", timeout=20000)
+            click_visible_text(page, "Persona Natural")
             human_delay()
-            page.click("text=Videoatención", timeout=20000)
+            click_visible_text(page, "Videoatención")
             human_delay()
-            page.click("text=Siguiente", timeout=20000)
+            page.screenshot(path="dian_paso2_tipo_persona.png")
+            click_visible_text(page, "Siguiente")
             human_delay(1.5, 3)
 
             # 3. Tipo de servicio: Devoluciones -> Siguiente
-            page.click("text=Devoluciones", timeout=20000)
+            page.screenshot(path="dian_paso3_tipo_servicio.png")
+            click_visible_text(page, "Devoluciones")
             human_delay()
-            page.click("text=Siguiente", timeout=20000)
+            click_visible_text(page, "Siguiente")
             human_delay(1.5, 3)
 
             # 4. Revisar si aparece el modal de "sin citas"

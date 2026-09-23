@@ -33,13 +33,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_dian.py
 
-      - name: Guardar captura del resultado
+      - name: Guardar capturas del resultado
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dian-screenshot
-          path: |
-            dian_result.png
-            dian_error.png
+          path: "*.png"
           if-no-files-found: ignore
           retention-days: 3
