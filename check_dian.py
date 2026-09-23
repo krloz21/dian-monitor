@@ -101,9 +101,31 @@ NO_CITAS_TEXTO = "No se encontraron especialidades relacionadas según los filtr
 #      Si NO aparece ese modal (y en cambio se ve un calendario/horarios) => SÍ hay citas.
 
 
-def click_visible_text(page, text, timeout=20000):
+def get_content_frame(page, timeout_ms=20000):
     """
-    Hace clic en el elemento con ese texto que esté VISIBLE en pantalla.
+    El portal de la DIAN corre embebido dentro de un iframe (la plataforma
+    se llama "C-Media WebPlayer"), y la página principal queda vacía.
+    Esta función busca, entre todos los frames de la página, cuál es el
+    que realmente tiene el contenido ("Agendamiento de citas") y lo
+    devuelve para operar ahí. Si por algún motivo no hay iframe (la DIAN
+    cambió el sitio), devuelve la página principal como respaldo.
+    """
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for frame in page.frames:
+            try:
+                if frame.get_by_text("Agendamiento de citas", exact=False).count() > 0:
+                    return frame
+            except Exception:
+                continue
+        time.sleep(0.5)
+    return page.main_frame
+
+
+def click_visible_text(frame, text, timeout=20000):
+    """
+    Hace clic en el elemento con ese texto que esté VISIBLE en pantalla,
+    dentro del frame (o página) que se le pase.
 
     El portal de la DIAN a veces repite el mismo texto dos veces en el HTML
     (una copia oculta para accesibilidad/responsive y otra visible).
@@ -112,7 +134,7 @@ def click_visible_text(page, text, timeout=20000):
     invisible. Este helper recorre TODAS las coincidencias y hace clic en
     la primera que esté realmente visible.
     """
-    locator = page.get_by_text(text, exact=False)
+    locator = frame.get_by_text(text, exact=False)
     locator.first.wait_for(state="attached", timeout=timeout)
     count = locator.count()
     for i in range(count):
@@ -152,33 +174,34 @@ def check_availability() -> bool:
         found = False
 
         try:
-            # 1. Home -> "Agendar cita"
+            # 1. Home -> localizar el iframe con el contenido -> "Agendar cita"
             page.goto(DIAN_URL, timeout=30000)
             human_delay(2, 4)
             page.screenshot(path="dian_paso1_home.png")
-            click_visible_text(page, "Agendar cita")
+            frame = get_content_frame(page)
+            click_visible_text(frame, "Agendar cita")
             human_delay()
 
             # 2. Persona Natural + Videoatención -> Siguiente
-            click_visible_text(page, "Persona Natural")
+            click_visible_text(frame, "Persona Natural")
             human_delay()
-            click_visible_text(page, "Videoatención")
+            click_visible_text(frame, "Videoatención")
             human_delay()
             page.screenshot(path="dian_paso2_tipo_persona.png")
-            click_visible_text(page, "Siguiente")
+            click_visible_text(frame, "Siguiente")
             human_delay(1.5, 3)
 
             # 3. Tipo de servicio: Devoluciones -> Siguiente
             page.screenshot(path="dian_paso3_tipo_servicio.png")
-            click_visible_text(page, "Devoluciones")
+            click_visible_text(frame, "Devoluciones")
             human_delay()
-            click_visible_text(page, "Siguiente")
+            click_visible_text(frame, "Siguiente")
             human_delay(1.5, 3)
 
             # 4. Revisar si aparece el modal de "sin citas"
             #    Le damos unos segundos a que el portal responda / renderice.
             try:
-                page.wait_for_selector(
+                frame.wait_for_selector(
                     f"text={NO_CITAS_TEXTO}", timeout=8000
                 )
                 # El modal apareció -> no hay citas disponibles
