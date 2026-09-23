@@ -1,0 +1,45 @@
+name: Monitor citas DIAN
+
+on:
+  schedule:
+    # Corre cada 30 minutos. GitHub puede retrasarlo un poco, es normal.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # permite lanzarlo manualmente desde la pestaña Actions
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Esperar un tiempo aleatorio (anti-patrón)
+        run: sleep $((RANDOM % 180))
+
+      - name: Ejecutar chequeo
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_dian.py
+
+      - name: Guardar captura del resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dian-screenshot
+          path: |
+            dian_result.png
+            dian_error.png
+          if-no-files-found: ignore
+          retention-days: 3
