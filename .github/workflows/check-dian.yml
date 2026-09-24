@@ -1,40 +1,96 @@
 name: Monitor citas DIAN
 
+# NOTA SOBRE LAS HORAS:
+# Los cron de GitHub van en UTC. Colombia es UTC-5, así que:
+#     hora Colombia + 5 = hora UTC
+# Ej: 6:00 Colombia = 11:00 UTC ; 20:00 Colombia = 01:00 UTC (del día siguiente).
+# Por eso los horarios de la noche aparecen en el "día siguiente" en UTC y los
+# días de la semana del cron están corridos (lunes Colombia = lunes 11:00-23:59
+# UTC + martes 00:00-01:59 UTC).
+
 on:
   schedule:
-    # Corre cada 30 minutos. GitHub puede retrasarlo un poco, es normal.
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}   # permite lanzarlo manualmente desde la pestaña Actions
+    # ---------- LUNES (cada 60 min, 6:00-20:00 Col) ----------
+    - cron: "0 11-23 * * 1"
+    - cron: "0 0-1 * * 2"
+
+    # ---------- MARTES (cada 45 min, 6:00-20:45 Col) ----------
+    - cron: "0,45 11-23 * * 2"
+    - cron: "15,30 12-23 * * 2"
+    - cron: "0,45 0-1 * * 3"
+    - cron: "15,30 0-1 * * 3"
+
+    # ---------- MIÉRCOLES (cada 30 min, 6:00-20:30 Col) ----------
+    - cron: "0,30 11-23 * * 3"
+    - cron: "0,30 0-1 * * 4"
+
+    # ---------- JUEVES (cada 20 min, 6:00-20:40 Col) ----------
+    - cron: "0,20,40 11-23 * * 4"
+    - cron: "0,20,40 0-1 * * 5"
+
+    # ---------- VIERNES ----------
+    # 6:00-9:50 Col (11:00-14:50 UTC) cada 10 min
+    - cron: "*/10 11-14 * * 5"
+    # 10:00-11:55 Col (15:00-16:55 UTC) cada 5 min  <- franja más intensa
+    - cron: "*/5 15-16 * * 5"
+    # 12:00-13:50 Col (17:00-18:50 UTC) cada 10 min
+    - cron: "*/10 17-18 * * 5"
+    # 14:00-20:50 Col (19:00-23:50 UTC + 00:00-01:50 UTC sáb) cada 10 min
+    - cron: "*/10 19-23 * * 5"
+    - cron: "*/10 0-1 * * 6"
+
+    # ---------- SÁBADO (cada 2 h, 6:00-20:00 Col) ----------
+    - cron: "0 11,13,15,17,19,21,23 * * 6"
+    - cron: "0 1 * * 0"
+
+    # ---------- DOMINGO (cada 2 h, 6:00-20:00 Col) ----------
+    - cron: "0 11,13,15,17,19,21,23 * * 0"
+    - cron: "0 1 * * 1"
+
+  workflow_dispatch: {}
+
+concurrency:
+  group: dian-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Clonar repositorio
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Recuperar estado (para saber si la página estaba caída)
+        uses: actions/cache/restore@v4
+        with:
+          path: .estado
+          key: dian-estado-${{ github.run_id }}
+          restore-keys: dian-estado-
 
       - name: Instalar dependencias
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Esperar un tiempo aleatorio (anti-patrón)
-        run: sleep $((RANDOM % 180))
-
-      - name: Ejecutar chequeo
+      - name: Consultar DIAN
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOPIC_2: ${{ secrets.NTFY_TOPIC_2 }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python check_dian.py
+          # En ejecución manual fuerza la consulta aunque esté fuera de horario
+          FORZAR: ${{ github.event_name == 'workflow_dispatch' }}
+        run: python check_dian.py --una-vez
 
-      - name: Guardar capturas del resultado
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .estado
+          key: dian-estado-${{ github.run_id }}
+
+      - name: Guardar capturas
         if: always()
         uses: actions/upload-artifact@v4
         with:
