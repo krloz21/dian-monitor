@@ -74,7 +74,7 @@ pip install -r requirements.txt
 playwright install chromium
 
 export DIAN_HEADLESS=false
-export NTFY_TOPIC="dian-carlos-9f3a21"
+export NTFY_TOPIC="xxxxxxx"
 
 python check_dian.py
 ```
