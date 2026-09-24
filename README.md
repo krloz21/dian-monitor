@@ -62,16 +62,31 @@ el `TELEGRAM_BOT_TOKEN`, y tu `TELEGRAM_CHAT_ID` hablándole a
    cada 30 minutos. También puedes lanzarlo manualmente desde la pestaña
    **Actions → Monitor citas DIAN → Run workflow**.
 
-## Probarlo localmente primero (recomendado)
+## Probarlo localmente y VER el navegador en tiempo real
+
+Esto es lo más útil para depurar: corre el mismo script en tu computador
+pero con una ventana de Chrome visible, para que veas exactamente dónde
+hace clic el script paso a paso (en GitHub Actions esto no se puede ver,
+solo queda el texto de log y las capturas).
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
 
+export DIAN_HEADLESS=false
 export NTFY_TOPIC="dian-carlos-9f3a21"
 
 python check_dian.py
 ```
+
+Se te va a abrir una ventana de Chrome sola (no la toques, no le hagas
+clic tú) y vas a ver cómo navega el portal solo. Al final la deja abierta
+15 segundos antes de cerrarla, para que revises el resultado.
+
+Cuando ya confirmes que funciona bien así, para dejarlo corriendo
+desatendido en GitHub Actions no necesitas tocar nada — ahí siempre corre
+en modo invisible (`DIAN_HEADLESS` no está definido en el workflow, así
+que usa el valor por defecto `true`).
 
 ## Sobre el riesgo de bloqueo
 

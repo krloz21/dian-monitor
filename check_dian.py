@@ -5,32 +5,35 @@ Monitor de citas disponibles en el portal de agendamiento de la DIAN.
 Uso:
     python check_dian.py
 
-Flujo que sigue (confirmado sobre el portal real):
-    Home -> "Agendar cita" -> Persona Natural + Videoatención -> Siguiente
-    -> "Devoluciones" -> Siguiente -> revisa si aparece el modal de
-    "No se encontraron especialidades..." (sin citas) o no (hay citas).
-
-Variables de entorno requeridas (ver README.md):
+Variables de entorno:
     DIAN_URL           -> URL del portal (ya viene por defecto)
-    NTFY_TOPIC         -> nombre único de tu canal ntfy.sh (ej: "dian-carlos-9f3a")
-    TELEGRAM_BOT_TOKEN -> (opcional) si prefieres Telegram en vez de ntfy
+    DIAN_HEADLESS       -> "false" para ver el navegador (debug local).
+                           En GitHub Actions se deja sin definir (= true).
+    NTFY_TOPIC         -> nombre de tu canal ntfy.sh principal
+    NTFY_TOPIC_2       -> (opcional) un segundo canal/celular a avisar
+    TELEGRAM_BOT_TOKEN -> (opcional) alternativa/adicional a ntfy
     TELEGRAM_CHAT_ID   -> (opcional)
 
-IMPORTANTE:
-- Este script hace foco en "parecer humano": delays aleatorios, user-agent real,
-  viewport normal, sin headless detectable. Aun así, la DIAN puede tener
-  captchas o bloqueos que requieran intervención manual — el script está
-  pensado para AVISARTE, no para agendar la cita automáticamente por ti.
-- No lo ejecutes con una frecuencia mayor a la configurada (cada 20-30 min).
-  Peticiones muy frecuentes son la forma más común de terminar bloqueado.
+Flujo que sigue (confirmado sobre el portal real):
+    Home -> "Agendar cita" -> Persona Natural -> Videoatención
+    -> "Devoluciones" -> revisa si aparece el modal de "sin citas".
+
+Nota sobre el diseño: la búsqueda de botones NO depende de selectores CSS
+frágiles (clases que la DIAN puede cambiar) sino de recorrer los elementos
+".boton" visibles y comparar su texto ya normalizado (sin tildes, minúsculas,
+sin espacios de más). Esto demostró ser más confiable que apuntar a clases
+específicas o depender de "esperar visibilidad" con timeouts que se cuelgan
+si hay pequeñas animaciones o reflows.
 """
 
 import os
 import random
 import time
 import sys
+import unicodedata
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
@@ -38,9 +41,20 @@ from playwright.sync_api import sync_playwright
 # ---------------------------------------------------------------------------
 DIAN_URL = os.environ.get("DIAN_URL", "https://agendamiento.dian.gov.co/")
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# En tu computador puedes poner DIAN_HEADLESS=false para VER el navegador
+# abrirse y hacer los clics en tiempo real (útil para probar/depurar).
+# En GitHub Actions siempre debe quedar en true (no hay pantalla ahí).
+HEADLESS = os.environ.get("DIAN_HEADLESS", "true").lower() != "false"
+
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+NTFY_TOPIC_2 = os.environ.get("NTFY_TOPIC_2", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+NO_CITAS_TEXTO = (
+    "No se encontraron especialidades relacionadas "
+    "según los filtros seleccionados."
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -50,30 +64,164 @@ USER_AGENTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
 def human_delay(a=0.8, b=2.4):
     """Pausa aleatoria para simular tiempos de lectura/click humanos."""
     time.sleep(random.uniform(a, b))
 
 
-def notify(message: str):
-    """Envía la alerta por ntfy.sh y/o Telegram, lo que esté configurado."""
+def normalizar_texto(texto):
+    """Quita tildes, pasa a minúsculas, colapsa espacios y quita puntuación
+    final, para poder comparar textos sin que un acento o una mayúscula
+    haga fallar la comparación."""
+    if not texto:
+        return ""
+    texto = unicodedata.normalize("NFD", texto)
+    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    texto = texto.lower()
+    texto = " ".join(texto.split())
+    texto = texto.rstrip(" .,:;!¡¿?")
+    return texto
+
+
+# ---------------------------------------------------------------------------
+# Búsqueda y clic de botones (robusto: recorre y compara texto normalizado)
+# ---------------------------------------------------------------------------
+
+def encontrar_boton_por_texto(page, texto_objetivo, selector=".boton"):
+    frame = page.main_frame
+    objetivo = normalizar_texto(texto_objetivo)
+    botones = frame.locator(selector)
+    cantidad = botones.count()
+
+    for i in range(cantidad):
+        boton = botones.nth(i)
+        try:
+            if not boton.is_visible():
+                continue
+            texto = boton.inner_text(timeout=1000)
+            if objetivo in normalizar_texto(texto):
+                return boton
+        except Exception:
+            continue
+    return None
+
+
+def hacer_clic_boton(page, texto, selector=".boton"):
+    boton = encontrar_boton_por_texto(page, texto, selector)
+    if boton is None:
+        raise RuntimeError(f"No se encontró el botón: {texto}")
+    boton.scroll_into_view_if_needed()
+    boton.click()
+    human_delay(1.5, 3)
+
+
+# ---------------------------------------------------------------------------
+# Detección de modales (para saber si hay citas o no)
+# ---------------------------------------------------------------------------
+
+def obtener_modales_visibles(page):
+    frame = page.main_frame
+    selectores = [".contenedor-modal", '[nombrepantalla="ModalError"]']
+    resultados = []
+
+    for selector in selectores:
+        try:
+            elementos = frame.locator(selector)
+            for i in range(elementos.count()):
+                elemento = elementos.nth(i)
+                try:
+                    if not elemento.is_visible():
+                        continue
+                    texto = elemento.inner_text(timeout=500)
+                    if texto and texto.strip():
+                        resultados.append(normalizar_texto(texto))
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return list(dict.fromkeys(resultados))
+
+
+def detectar_respuesta_dian(page, timeout=30):
+    """
+    Después de seleccionar Devoluciones, espera hasta `timeout` segundos a
+    que aparezca una respuesta clara:
+      - "NO_CITAS"      -> apareció el modal conocido de "sin citas"
+      - "OTRA_RESPUESTA" -> apareció un modal distinto (probablemente SÍ
+                            hay citas: calendario/horarios)
+      - "SIN_RESPUESTA"  -> no se pudo confirmar nada en el tiempo dado
+
+    No se usa el texto general de toda la página para decidir, porque la
+    página contiene palabras como "cita", "agenda", "fecha", etc. incluso
+    cuando no hay disponibilidad — solo se confía en los modales.
+    """
+    objetivo_no_citas = normalizar_texto(NO_CITAS_TEXTO)
+    inicio = time.time()
+
+    while time.time() - inicio < timeout:
+        try:
+            modales = obtener_modales_visibles(page)
+
+            for texto_modal in modales:
+                if objetivo_no_citas in texto_modal:
+                    return "NO_CITAS"
+
+            for texto_modal in modales:
+                if "aceptar" in texto_modal and objetivo_no_citas not in texto_modal:
+                    print(f"[INFO] Modal distinto encontrado: {texto_modal}")
+                    return "OTRA_RESPUESTA"
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    return "SIN_RESPUESTA"
+
+
+def aceptar_modal(page):
+    """Cierra el modal de 'sin citas' dándole clic a su botón Aceptar."""
+    try:
+        hacer_clic_boton(page, "Aceptar")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Notificaciones
+# ---------------------------------------------------------------------------
+
+def _enviar_ntfy(topic, mensaje, titulo):
+    try:
+        r = requests.post(
+            f"https://ntfy.sh/{topic}",
+            data=mensaje.encode("utf-8"),
+            headers={"Title": titulo, "Priority": "urgent", "Tags": "warning,calendar"},
+            timeout=10,
+        )
+        return 200 <= r.status_code < 300, topic, None
+    except Exception as e:
+        return False, topic, str(e)
+
+
+def notify(message: str, title: str = "Cita DIAN disponible"):
+    """Envía la alerta por ntfy.sh (uno o dos canales) y/o Telegram."""
     sent = False
 
-    if NTFY_TOPIC:
-        try:
-            requests.post(
-                f"https://ntfy.sh/{NTFY_TOPIC}",
-                data=message.encode("utf-8"),
-                headers={
-                    "Title": "Cita DIAN disponible",
-                    "Priority": "urgent",
-                    "Tags": "warning,calendar",
-                },
-                timeout=10,
-            )
-            sent = True
-        except Exception as e:
-            print(f"[WARN] No se pudo notificar por ntfy.sh: {e}")
+    topics = [t for t in (NTFY_TOPIC, NTFY_TOPIC_2) if t]
+    if topics:
+        with ThreadPoolExecutor(max_workers=len(topics)) as executor:
+            trabajos = [executor.submit(_enviar_ntfy, t, message, title) for t in topics]
+            for trabajo in as_completed(trabajos):
+                ok, topic, error = trabajo.result()
+                if ok:
+                    sent = True
+                    print(f"[OK] ntfy enviado a: {topic}")
+                else:
+                    print(f"[WARN] No se pudo notificar a {topic}: {error}")
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -87,76 +235,26 @@ def notify(message: str):
             print(f"[WARN] No se pudo notificar por Telegram: {e}")
 
     if not sent:
-        print("[WARN] No hay ningún canal de notificación configurado.")
+        print("[WARN] No hay ningún canal de notificación configurado o todos fallaron.")
     print(f"[NOTIFY] {message}")
 
 
-NO_CITAS_TEXTO = "No se encontraron especialidades relacionadas según los filtros seleccionados"
-
-# Flujo confirmado sobre https://agendamiento.dian.gov.co/ :
-#   1. Card "Agendar cita" en la home
-#   2. "Persona Natural" + "Videoatención" -> Siguiente
-#   3. Tipo de servicio: "Devoluciones." -> Siguiente
-#   4. Si aparece el modal "No se encontraron especialidades..." => NO hay citas.
-#      Si NO aparece ese modal (y en cambio se ve un calendario/horarios) => SÍ hay citas.
-
-
-def get_content_frame(page, timeout_ms=20000):
-    """
-    El portal de la DIAN corre embebido dentro de un iframe (la plataforma
-    se llama "C-Media WebPlayer"), y la página principal queda vacía.
-    Esta función busca, entre todos los frames de la página, cuál es el
-    que realmente tiene el contenido ("Agendamiento de citas") y lo
-    devuelve para operar ahí. Si por algún motivo no hay iframe (la DIAN
-    cambió el sitio), devuelve la página principal como respaldo.
-    """
-    deadline = time.time() + timeout_ms / 1000
-    while time.time() < deadline:
-        for frame in page.frames:
-            try:
-                if frame.get_by_text("Agendamiento de citas", exact=False).count() > 0:
-                    return frame
-            except Exception:
-                continue
-        time.sleep(0.5)
-    return page.main_frame
-
-
-def click_visible_text(frame, text, timeout=20000):
-    """
-    Hace clic en el elemento con ese texto que esté VISIBLE en pantalla,
-    dentro del frame (o página) que se le pase.
-
-    El portal de la DIAN a veces repite el mismo texto dos veces en el HTML
-    (una copia oculta para accesibilidad/responsive y otra visible).
-    page.click("text=...") a secas agarra la primera coincidencia sin
-    importar si está oculta, y se queda esperando eternamente si esa es
-    invisible. Este helper recorre TODAS las coincidencias y hace clic en
-    la primera que esté realmente visible.
-    """
-    locator = frame.get_by_text(text, exact=False)
-    locator.first.wait_for(state="attached", timeout=timeout)
-    count = locator.count()
-    for i in range(count):
-        candidate = locator.nth(i)
-        if candidate.is_visible():
-            candidate.click(timeout=timeout)
-            return
-    raise Exception(f"No se encontró ningún elemento VISIBLE con texto: '{text}'")
-
+# ---------------------------------------------------------------------------
+# Flujo principal de navegación
+# ---------------------------------------------------------------------------
 
 def check_availability() -> bool:
     """
     Entra al portal, sigue el flujo Agendar cita -> Persona Natural ->
-    Videoatención -> Devoluciones, y revisa si aparece el modal de
-    "no hay especialidades disponibles".
+    Videoatención -> Devoluciones, y revisa qué modal aparece.
 
-    Devuelve True si encontró disponibilidad (NO apareció el modal de "sin
-    citas"), False si no hay citas o si algo falló en la navegación.
+    Devuelve True si encontró disponibilidad, False si no hay citas o si
+    algo falló / no se pudo confirmar (por seguridad, ante la duda no se
+    notifica una falsa alarma).
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
+            headless=HEADLESS,
             args=["--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(
@@ -165,7 +263,6 @@ def check_availability() -> bool:
             locale="es-CO",
             timezone_id="America/Bogota",
         )
-        # Oculta el flag que delata a Playwright/Selenium como bot
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -174,47 +271,37 @@ def check_availability() -> bool:
         found = False
 
         try:
-            # 1. Home -> localizar el iframe con el contenido -> "Agendar cita"
-            page.goto(DIAN_URL, timeout=30000)
-            human_delay(2, 4)
+            # 1. Home -> Agendar cita
+            page.goto(DIAN_URL, wait_until="domcontentloaded", timeout=60000)
+            human_delay(3, 5)
             page.screenshot(path="dian_paso1_home.png")
-            frame = get_content_frame(page)
-            click_visible_text(frame, "Agendar cita")
-            human_delay()
+            hacer_clic_boton(page, "Agendar cita")
 
-            # 2. Persona Natural + Videoatención -> Siguiente
-            click_visible_text(frame, "Persona Natural")
-            human_delay()
-            click_visible_text(frame, "Videoatención")
-            human_delay()
+            # 2. Persona Natural
+            hacer_clic_boton(page, "Persona Natural")
+
+            # 3. Videoatención
+            hacer_clic_boton(page, "Videoatención")
             page.screenshot(path="dian_paso2_tipo_persona.png")
-            click_visible_text(frame, "Siguiente")
-            human_delay(1.5, 3)
 
-            # 3. Tipo de servicio: Devoluciones -> Siguiente
+            # 4. Tipo de servicio: Devoluciones
             page.screenshot(path="dian_paso3_tipo_servicio.png")
-            click_visible_text(frame, "Devoluciones")
-            human_delay()
-            click_visible_text(frame, "Siguiente")
-            human_delay(1.5, 3)
+            hacer_clic_boton(page, "Devoluciones")
 
-            # 4. Revisar si aparece el modal de "sin citas"
-            #    Le damos unos segundos a que el portal responda / renderice.
-            try:
-                frame.wait_for_selector(
-                    f"text={NO_CITAS_TEXTO}", timeout=8000
-                )
-                # El modal apareció -> no hay citas disponibles
-                found = False
-            except Exception:
-                # El modal NO apareció dentro del tiempo de espera.
-                # Asumimos que el flujo avanzó a un calendario/horarios,
-                # es decir, sí hay disponibilidad.
-                found = True
-
-            # Guarda siempre una captura del resultado para poder verificar
-            # visualmente qué vio el script (útil sobre todo al principio).
+            # 5. Esperar la respuesta (modal de sin citas, u otro modal)
+            resultado = detectar_respuesta_dian(page, timeout=30)
             page.screenshot(path="dian_result.png")
+
+            if resultado == "NO_CITAS":
+                print("[RESULTADO] No hay citas disponibles.")
+                aceptar_modal(page)
+                found = False
+            elif resultado == "OTRA_RESPUESTA":
+                print("[RESULTADO] ¡Posible disponibilidad! Apareció una respuesta distinta.")
+                found = True
+            else:
+                print("[RESULTADO] No se pudo confirmar disponibilidad (sin respuesta clara).")
+                found = False
 
         except Exception as e:
             print(f"[ERROR] Fallo navegando el portal: {e}")
@@ -224,6 +311,9 @@ def check_availability() -> bool:
                 pass
             found = False
         finally:
+            if not HEADLESS:
+                print("Terminó el flujo. Dejo el navegador abierto 15s para que lo veas...")
+                time.sleep(15)
             browser.close()
 
         return found
@@ -241,11 +331,11 @@ def main():
 
     if disponible:
         notify(
-            f"¡Hay citas de Devoluciones (videoatención) disponibles en la "
-            f"DIAN! Entra ya a agendar: {DIAN_URL}"
+            f"¡Hay citas de Devoluciones (videoatención) posiblemente disponibles "
+            f"en la DIAN! Entra ya a revisar: {DIAN_URL}"
         )
     else:
-        print("Sin disponibilidad por ahora.")
+        print("Sin disponibilidad confirmada por ahora.")
 
 
 if __name__ == "__main__":
