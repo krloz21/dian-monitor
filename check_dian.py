@@ -89,6 +89,11 @@ USER_AGENTS = [
 CITAS = "CITAS"
 NO_CITAS = "NO_CITAS"
 CAIDA = "CAIDA"
+POSIBLE = "POSIBLE"   # portal saturado (logo cargando / "Cargando") = posible cita
+
+# Para no llenarte el celular de alertas: si ya te avisó "posibilidad de cita"
+# hace menos de estos minutos, no vuelve a avisar.
+ENFRIAMIENTO_POSIBLE_MIN = 20
 
 
 # ============================================================
@@ -132,13 +137,15 @@ def leer_estado():
         return {}
 
 
-def guardar_estado(resultado):
+def guardar_estado(resultado=None, **extra):
+    estado = leer_estado()
+    if resultado is not None:
+        estado["ultima_consulta"] = ahora().isoformat()
+        estado["ultimo_resultado"] = resultado
+    estado.update(extra)
     os.makedirs(os.path.dirname(ARCHIVO_ESTADO), exist_ok=True)
     with open(ARCHIVO_ESTADO, "w", encoding="utf-8") as f:
-        json.dump(
-            {"ultima_consulta": ahora().isoformat(), "ultimo_resultado": resultado},
-            f,
-        )
+        json.dump(estado, f)
 
 
 # ============================================================
@@ -158,7 +165,7 @@ def encontrar_boton_por_texto(page, texto_objetivo, selector=".boton"):
     return None
 
 
-def hacer_clic_boton(page, texto, intentos=10):
+def hacer_clic_boton(page, texto, intentos=15):
     """Busca el botón varias veces (la página puede tardar en pintarlo)."""
     for _ in range(intentos):
         boton = encontrar_boton_por_texto(page, texto)
@@ -169,6 +176,34 @@ def hacer_clic_boton(page, texto, intentos=10):
             return
         time.sleep(1.5)
     raise RuntimeError(f"No se encontró el botón: {texto}")
+
+
+def portal_saturado(page):
+    """True si el portal está atascado en una de las dos pantallas de carga:
+      1. El logo amarillo en fondo blanco (la app ni siquiera termina de abrir).
+      2. El aviso "Cargando" encima del formulario (no aparecen los botones).
+    En ambos casos no hay ninguna tarjeta ".boton" visible con contenido.
+    """
+    try:
+        cargando = page.main_frame.get_by_text("Cargando", exact=True)
+        for i in range(cargando.count()):
+            if cargando.nth(i).is_visible():
+                return True
+    except Exception:
+        pass
+
+    try:
+        botones = page.main_frame.locator(".boton")
+        for i in range(botones.count()):
+            b = botones.nth(i)
+            if b.is_visible() and b.inner_text(timeout=500).strip():
+                texto = normalizar_texto(b.inner_text(timeout=500))
+                # "Anterior"/"Siguiente" se ven aunque el formulario no cargue
+                if texto not in ("anterior", "siguiente"):
+                    return False
+    except Exception:
+        pass
+    return True
 
 
 def obtener_modales_visibles(page):
@@ -255,17 +290,24 @@ def consultar_dian():
             elif r == CITAS:
                 log("Resultado: ¡POSIBLES CITAS DISPONIBLES!")
                 resultado = CITAS
+            elif portal_saturado(page):
+                log("Se quedó cargando después de Devoluciones -> POSIBILIDAD DE CITA.")
+                resultado = POSIBLE
             else:
                 log("La página no respondió a tiempo -> se trata como caída.")
                 resultado = CAIDA
 
         except Exception as e:
-            log(f"Fallo navegando el portal (se trata como caída): {e}")
             try:
                 page.screenshot(path="dian_error.png")
             except Exception:
                 pass
-            resultado = CAIDA
+            if portal_saturado(page):
+                log(f"El portal quedó atascado cargando -> POSIBILIDAD DE CITA. ({e})")
+                resultado = POSIBLE
+            else:
+                log(f"Fallo navegando el portal (se trata como caída): {e}")
+                resultado = CAIDA
 
         finally:
             if not HEADLESS:
@@ -304,6 +346,22 @@ def notificar(mensaje, titulo="Cita DIAN disponible"):
             log(f"ntfy {topic}: {'enviado' if ok else 'ERROR ' + str(error)}")
 
 
+def avisar_posibilidad():
+    estado = leer_estado()
+    ultima = estado.get("ultima_alerta_posible")
+    if ultima:
+        minutos = (ahora() - datetime.fromisoformat(ultima)).total_seconds() / 60
+        if minutos < ENFRIAMIENTO_POSIBLE_MIN:
+            log(f"Ya se avisó 'posibilidad de cita' hace {minutos:.0f} min. No se repite.")
+            return
+    notificar(
+        "El portal de la DIAN está saturado (se queda cargando). "
+        f"Puede que estén liberando citas: entra a intentar. {DIAN_URL}",
+        titulo="Posibilidad de cita",
+    )
+    guardar_estado(ultima_alerta_posible=ahora().isoformat())
+
+
 def consultar_y_avisar():
     resultado = consultar_dian()
     if resultado == CITAS:
@@ -311,6 +369,8 @@ def consultar_y_avisar():
             "¡Hay citas de Devoluciones (videoatención) posiblemente disponibles "
             f"en la DIAN! Entra ya: {DIAN_URL}"
         )
+    elif resultado == POSIBLE:
+        avisar_posibilidad()
     return resultado
 
 
@@ -343,9 +403,9 @@ def modo_una_vez():
     espera_min = INTERVALO_REINTENTO_CAIDA if en_franja_viernes(ahora()) else 2
 
     intento = 0
-    while resultado == CAIDA and intento < reintentos:
+    while resultado in (CAIDA, POSIBLE) and intento < reintentos:
         intento += 1
-        log(f"Página caída. Reintento {intento}/{reintentos} en {espera_min} min...")
+        log(f"Página caída/saturada. Reintento {intento}/{reintentos} en {espera_min} min...")
         time.sleep(espera_min * 60)
         resultado = consultar_y_avisar()
 
